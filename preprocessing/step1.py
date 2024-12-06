@@ -1,13 +1,31 @@
 import numpy as np # linear algebra
 import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
-import dicom
+import pydicom as dicom
 import os
 import scipy.ndimage
+from scipy import ndimage
 import matplotlib.pyplot as plt
-
+import nibabel as nib
 from skimage import measure, morphology
 
+def load_scan_nii(path):
+    # 假设path是包含.nii或.nii.gz文件的文件夹路径
+    files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith('.nii') or f.endswith('.nii.gz')]
+    files.sort()  # 根据文件名排序，通常NIfTI文件名包含顺序信息
+    slices = [nib.load(f) for f in files]  # 加载每个NIfTI文件
 
+    # 计算切片厚度
+    if len(slices) > 1:
+        slice_thickness = np.abs(slices[0].header.get_zooms()[2] - slices[1].header.get_zooms()[2])
+    else:
+        slice_thickness = 1  # 如果只有一个切片，厚度设为1或其他默认值
+
+    for i, s in enumerate(slices):
+        # 设置切片厚度，这里只是示例，实际上NIfTI头部信息可能不需要这样设置
+        # 如果需要修改头部信息，可以使用s.header.set_zooms()方法
+        s.header.set_zooms(s.header.get_zooms()[:-1] + (slice_thickness,))
+
+    return slices
 
 def load_scan(path):
     slices = [dicom.read_file(path + '/' + s) for s in os.listdir(path)]
@@ -29,7 +47,27 @@ def load_scan(path):
         s.SliceThickness = slice_thickness
         
     return slices
+def get_pixels_hu_nii(slices):
+    # 假设slices是一个包含多个NIfTI图像对象的列表
+    image = np.stack([nii.get_fdata() for nii in slices])
+    image = image.astype(np.int16)  # 转换为int16类型
 
+    # NIfTI图像通常不包含RescaleIntercept和RescaleSlope，因此我们假设它们为0和1
+    # 如果您有这些值，可以从其他来源获取并替换这里的0和1
+    intercept = 0
+    slope = 1
+
+    # 应用slope和intercept转换
+    if slope != 1:
+        image = slope * image.astype(np.float64)
+    image = image.astype(np.int16)
+    image += np.int16(intercept)
+
+    # 获取第一个切片的SliceThickness和PixelSpacing
+    slice_thickness = slices[0].header.get_zooms()[2]  # Z轴方向的分辨率
+    pixel_spacing = slices[0].header.get_zooms()[:2]  # XY平面的分辨率
+
+    return np.array(image, dtype=np.int16), np.array([slice_thickness] + list(pixel_spacing), dtype=np.float32)
 def get_pixels_hu(slices):
     image = np.stack([s.pixel_array for s in slices])
     # Convert to int16 (from sometimes int16), 
@@ -48,6 +86,39 @@ def get_pixels_hu(slices):
         image[slice_number] += np.int16(intercept)
     
     return np.array(image, dtype=np.int16), np.array([slices[0].SliceThickness] + slices[0].PixelSpacing, dtype=np.float32)
+
+
+def binarize_per_slice_nii(image, spacing, intensity_th=-600, sigma=1, area_th=30, eccen_th=0.99, bg_patch_size=10):
+    bw = np.zeros(image.shape[1:4], dtype=bool)
+
+    # Prepare a mask, with all corner values set to NaN
+    image_size = image.shape[1]  # Assuming the second dimension is the image size
+    grid_axis = np.linspace(-image_size / 2 + 0.5, image_size / 2 - 0.5, image_size)
+    x, y = np.meshgrid(grid_axis, grid_axis)
+    d = (x ** 2 + y ** 2) ** 0.5
+    nan_mask = (d < image_size / 2).astype(float)
+    nan_mask[nan_mask == 0] = np.nan
+
+    for i in range(image.shape[0]):
+        # Check if corner pixels are identical, if so the slice before Gaussian filtering
+        if len(np.unique(image[i, 0:bg_patch_size, 0:bg_patch_size])) == 1:
+            current_slice = np.multiply(image[i].astype('float32'), nan_mask)
+        else:
+            current_slice = image[i].astype('float32')
+
+        current_bw = ndimage.filters.gaussian_filter(current_slice, sigma, truncate=2.0) < intensity_th
+
+        # Select proper components
+        label = measure.label(current_bw)
+        properties = measure.regionprops(label, intensity_image=current_slice)
+        valid_label = set()
+        for prop in properties:
+            if prop.area * spacing[0] * spacing[1] > area_th and prop.eccentricity < eccen_th:
+                valid_label.add(prop.label)
+        current_bw = np.in1d(label, list(valid_label)).reshape(label.shape)
+        bw[i] = current_bw
+
+    return bw
 
 def binarize_per_slice(image, spacing, intensity_th=-600, sigma=1, area_th=30, eccen_th=0.99, bg_patch_size=10):
     bw = np.zeros(image.shape, dtype=bool)
@@ -226,9 +297,9 @@ def two_lung_only(bw, spacing, max_iter=22, max_ratio=4.8):
     return bw1, bw2, bw
 
 def step1_python(case_path):
-    case = load_scan(case_path)
-    case_pixels, spacing = get_pixels_hu(case)
-    bw = binarize_per_slice(case_pixels, spacing)
+    case = load_scan_nii(case_path)
+    case_pixels, spacing = get_pixels_hu_nii(case)
+    bw = binarize_per_slice_nii(case_pixels, spacing)
     flag = 0
     cut_num = 0
     cut_step = 2
@@ -243,10 +314,10 @@ def step1_python(case_path):
     return case_pixels, bw1, bw2, spacing
     
 if __name__ == '__main__':
-    INPUT_FOLDER = '/work/DataBowl3/stage1/stage1/'
+    INPUT_FOLDER = 'E:\Desktop\examples'
     patients = os.listdir(INPUT_FOLDER)
     patients.sort()
-    case_pixels, m1, m2, spacing = step1_python(os.path.join(INPUT_FOLDER,patients[25]))
+    case_pixels, m1, m2, spacing = step1_python(os.path.join(INPUT_FOLDER,patients[0]))
     plt.imshow(m1[60])
     plt.figure()
     plt.imshow(m2[60])
